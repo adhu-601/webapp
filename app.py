@@ -27,6 +27,8 @@ from werkzeug.utils import secure_filename  # Secure filename handling
 import google.generativeai as genai  # Gemini API for image captioning
 import base64  # Encoding image data for API processing
 from io import BytesIO  # Handling in-memory file objects
+from PIL import Image
+
 
 # Configure Gemini API, REPLACE with your Gemini API key
 GOOGLE_API_KEY = ""
@@ -106,89 +108,105 @@ def upload_form():
 
 @app.route("/upload", methods=["GET", "POST"])
 def upload_image():
-    """
-    Handles image upload, stores the file in AWS S3,
-    generates a caption using Gemini API, and saves metadata in MySQL RDS.
-    """
     if request.method == "POST":
         if "file" not in request.files:
             return render_template("upload.html", error="No file selected")
-
         file = request.files["file"]
-
         if file.filename == "":
             return render_template("upload.html", error="No file selected")
-
         if not allowed_file(file.filename):
             return render_template("upload.html", error="Invalid file type")
 
         filename = secure_filename(file.filename)
-        file_data = file.read()  # Read file as binary
+        file_data = file.read()
+        s3 = get_s3_client()
 
-        # Upload file to S3
+        # Upload original image
+        original_key = f"uploads/originals/{filename}"
         try:
-            s3 = get_s3_client()  # Get a fresh S3 client
-            s3.upload_fileobj(BytesIO(file_data), S3_BUCKET, filename)
+            s3.upload_fileobj(BytesIO(file_data), S3_BUCKET, original_key)
         except Exception as e:
             return render_template("upload.html", error=f"S3 Upload Error: {str(e)}")
 
         # Generate caption
         caption = generate_image_caption(file_data)
 
-        # Save metadata to the database
+        # Save metadata to RDS
         try:
             connection = get_db_connection()
             if connection is None:
-                return render_template("upload.html", error="Database Error: Unable to connect to the database.")
+                return render_template("upload.html", error="Database Error")
             cursor = connection.cursor()
             cursor.execute(
                 "INSERT INTO captions (image_key, caption) VALUES (%s, %s)",
-                (filename, caption),
+                (original_key, caption),
             )
             connection.commit()
             connection.close()
         except Exception as e:
             return render_template("upload.html", error=f"Database Error: {str(e)}")
 
-        # Prepare image for frontend display using Base64 encoding
+        # Generate and upload thumbnail
+        try:
+            image = Image.open(BytesIO(file_data))
+            if image.mode in ("RGBA", "P"):
+                image = image.convert("RGB")
+
+            image.thumbnail((128, 128))
+            buffer = BytesIO()
+            image.save(buffer, format="JPEG")
+            buffer.seek(0)
+
+            thumbnail_key = f"uploads/thumbnails/{filename}"
+            s3.upload_fileobj(buffer, S3_BUCKET, thumbnail_key)
+
+        except Exception as e:
+            print(f"[ERROR] Thumbnail generation failed: {str(e)}")
+
+        # Render upload result page
         encoded_image = base64.b64encode(file_data).decode("utf-8")
-        file_url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{filename}"
-        
+        file_url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{original_key}"
+
         return render_template("upload.html", image_data=encoded_image, file_url=file_url, caption=caption)
 
     return render_template("upload.html")
 
+
 @app.route("/gallery")
 def gallery():
-    """
-    Retrieves images and their captions from the database,
-    generates pre-signed URLs for secure access, and renders the gallery page.
-    """
     try:
         connection = get_db_connection()
         if connection is None:
             return render_template("gallery.html", error="Database Error: Unable to connect to the database.")
+
         cursor = connection.cursor(dictionary=True)
         cursor.execute("SELECT image_key, caption FROM captions ORDER BY uploaded_at DESC")
         results = cursor.fetchall()
         connection.close()
 
-        images_with_captions = [
-            {
-                "url": get_s3_client().generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": S3_BUCKET, "Key": row["image_key"]},
-                    ExpiresIn=3600,  # URL expires in 1 hour
-                ),
-                "caption": row["caption"],
-            }
-            for row in results
-        ]
+        # Generate URLs for thumbnails only
+        images_with_captions = []
+        for row in results:
+            original_key = row["image_key"]
+            filename = original_key.split("/")[-1]
+            thumbnail_key = f"uploads/thumbnails/{filename}"
+
+            presigned_url = get_s3_client().generate_presigned_url(
+                "get_object",
+                Params={"Bucket": S3_BUCKET, "Key": thumbnail_key},
+                ExpiresIn=3600,
+            )
+
+            images_with_captions.append({
+                "url": presigned_url,
+                "caption": row["caption"]
+            })
 
         return render_template("gallery.html", images=images_with_captions)
 
     except Exception as e:
         return render_template("gallery.html", error=f"Database Error: {str(e)}")
+
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
